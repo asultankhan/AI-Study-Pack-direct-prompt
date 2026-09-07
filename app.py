@@ -159,7 +159,8 @@ def generate_study_pack(
     try:
         client = Groq(api_key=key)
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            # This production model is available on Groq's Developer plan.
+            model="openai/gpt-oss-20b",
             temperature=0.35,
             response_format={"type": "json_object"},
             messages=[
@@ -268,4 +269,3 @@ if __name__ == "__main__":
         run_streamlit()
     else:
         run_gradio()
-
