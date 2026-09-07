@@ -92,7 +92,10 @@ Return ONLY valid JSON. Include only the requested component keys, using this sc
 
 
 def _to_markdown(data: dict[str, Any], topic: str) -> str:
-    lines = [f"# Study Pack: {topic.strip()}"]
+    lines = [
+        f"# Study Pack: {topic.strip()}",
+        "*AI workflow completed: Planning → Content → Assessment → Review → Refinement*",
+    ]
 
     if data.get("topic_summary"):
         lines += ["\n## Topic Summary", str(data["topic_summary"])]
@@ -146,6 +149,7 @@ def generate_study_pack(
     plan_days: int,
     components: list[str],
     api_key: str = "",
+    progress_callback=None,
 ) -> str:
     if not topic or not topic.strip():
         return "Please enter a study topic."
@@ -156,23 +160,92 @@ def generate_study_pack(
     if not key:
         return "GROQ_API_KEY is missing. Add it in Colab, Streamlit Secrets, or the API-key field."
 
+    def update(stage: str, detail: str) -> None:
+        if progress_callback:
+            progress_callback(stage, detail)
+
+    def call_stage(client: Groq, stage: str, instruction: str, context: dict[str, Any]) -> dict[str, Any]:
+        """Run one workflow stage with JSON parsing, repair, and clear stage errors."""
+        update(stage, "Running")
+        compact_context = json.dumps(context, ensure_ascii=False)[:30000]
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert instructional designer. Return only one valid JSON object, "
+                    "without Markdown fences, comments, or text outside the JSON."
+                ),
+            },
+            {"role": "user", "content": f"TASK:\n{instruction}\n\nCONTEXT:\n{compact_context}"},
+        ]
+        try:
+            response = client.chat.completions.create(
+                model="openai/gpt-oss-20b", temperature=0.2, messages=messages
+            )
+            raw = response.choices[0].message.content or ""
+            try:
+                result = _extract_json(raw)
+            except (ValueError, json.JSONDecodeError):
+                repair = client.chat.completions.create(
+                    model="openai/gpt-oss-20b",
+                    temperature=0,
+                    messages=[
+                        {"role": "system", "content": "Convert the input into valid JSON only."},
+                        {"role": "user", "content": raw[:30000]},
+                    ],
+                )
+                result = _extract_json(repair.choices[0].message.content or "")
+            update(stage, "Completed")
+            return result
+        except Exception as exc:
+            update(stage, "Failed")
+            raise RuntimeError(f"{stage} stage failed: {exc}") from exc
+
     try:
         client = Groq(api_key=key)
-        response = client.chat.completions.create(
-            # This production model is available on Groq's Developer plan.
-            model="openai/gpt-oss-20b",
-            temperature=0.35,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": "You create reliable educational materials and output strict JSON."},
-                {"role": "user", "content": _prompt(
-                    topic, level, language, difficulty, notes, int(flashcard_count),
-                    int(mcq_count), int(short_count), int(plan_days), components
-                )},
-            ],
+        request_context = {
+            "topic": topic.strip(), "learner_level": level, "language": language,
+            "difficulty": difficulty, "notes": notes.strip(), "components": components,
+            "counts": {"flashcards": int(flashcard_count), "mcqs": int(mcq_count),
+                       "short_answers": int(short_count), "study_days": int(plan_days)},
+        }
+
+        plan = call_stage(
+            client, "1. Planning",
+            "Create a learning design plan with keys: learning_objectives (array), scope (array), "
+            "sequence (array), assessment_strategy (string), and source_guidance (string).",
+            request_context,
         )
-        data = _extract_json(response.choices[0].message.content or "")
-        return _to_markdown(data, topic)
+        content = call_stage(
+            client, "2. Content generation",
+            "Using the plan and user request, draft only the requested instructional components. "
+            "Use keys topic_summary, key_concepts, flashcards, and study_plan following the original schema. "
+            "Respect the requested counts and use notes as the primary source when supplied.",
+            {"request": request_context, "plan": plan},
+        )
+        assessment = call_stage(
+            client, "3. Assessment",
+            "Create the requested multiple_choice_quiz and short_answer_questions. Each MCQ must have "
+            "four options, one answer letter, and an explanation. Include model answers for short questions.",
+            {"request": request_context, "plan": plan, "content": content},
+        )
+        review = call_stage(
+            client, "4. Quality review",
+            "Audit alignment, accuracy, clarity, difficulty, language, counts, answer correctness, duplication, "
+            "and consistency with supplied notes. Return keys passed (boolean), issues (array), and improvements (array).",
+            {"request": request_context, "plan": plan, "content": content, "assessment": assessment},
+        )
+        final_pack = call_stage(
+            client, "5. Refinement",
+            "Produce the corrected final study pack using the review. Return only requested keys from this schema: "
+            "topic_summary; key_concepts[{concept, explanation}]; flashcards[{front, back}]; "
+            "multiple_choice_quiz[{question, options, answer, explanation}]; "
+            "short_answer_questions[{question, model_answer}]; study_plan[{day, focus, activities}]. "
+            "Meet all requested counts exactly.",
+            {"request": request_context, "plan": plan, "content": content,
+             "assessment": assessment, "review": review},
+        )
+        return _to_markdown(final_pack, topic)
     except Exception as exc:
         return f"Generation failed: {exc}"
 
@@ -239,11 +312,23 @@ def run_streamlit() -> None:
     components = st.multiselect("Study-pack components", COMPONENTS, default=COMPONENTS)
 
     if st.button("Generate Study Pack", type="primary", use_container_width=True):
-        with st.spinner("Preparing your study pack..."):
+        with st.status("Running the AI workflow...", expanded=True) as workflow_status:
+            stage_lines = {}
+
+            def show_progress(stage: str, detail: str) -> None:
+                stage_lines[stage] = detail
+                icon = "✅" if detail == "Completed" else "❌" if detail == "Failed" else "⏳"
+                st.write(f"{icon} {stage}: {detail}")
+
             result = generate_study_pack(
                 topic, level, language, difficulty, notes, flashcards, mcqs,
-                short_questions, days, components, api_key or stored_key
+                short_questions, days, components, api_key or stored_key,
+                progress_callback=show_progress,
             )
+            if result.startswith("Generation failed:"):
+                workflow_status.update(label="Workflow stopped with an error", state="error")
+            else:
+                workflow_status.update(label="AI study-pack workflow completed", state="complete")
         st.session_state["study_pack"] = result
 
     if "study_pack" in st.session_state:
