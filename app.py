@@ -10,6 +10,7 @@ import re
 from typing import Any
 
 from groq import Groq
+from json_repair import repair_json
 
 
 APP_TITLE = "AI Study Pack Generator"
@@ -30,12 +31,14 @@ def _extract_json(text: str) -> dict[str, Any]:
     """Extract a JSON object even if the model adds a Markdown fence."""
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.I)
     try:
-        return json.loads(cleaned)
+        result = json.loads(cleaned)
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", cleaned, flags=re.S)
-        if not match:
-            raise ValueError("The AI response was not valid JSON. Please try again.")
-        return json.loads(match.group(0))
+        candidate = match.group(0) if match else cleaned
+        result = repair_json(candidate, return_objects=True, ensure_ascii=False)
+    if not isinstance(result, dict) or not result:
+        raise ValueError("The AI response could not be converted into a JSON object.")
+    return result
 
 
 def _prompt(
